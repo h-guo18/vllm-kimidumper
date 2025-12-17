@@ -1266,7 +1266,10 @@ class DeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = []
+        for layer_idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+            if layer_idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
@@ -1274,7 +1277,10 @@ class DeepseekV2Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
+                
         hidden_states, _ = self.norm(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -1632,6 +1638,12 @@ class DeepseekV2ForCausalLM(
                 loaded_params.add(name)
 
         return loaded_params
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
 
 class DeepseekForCausalLM(DeepseekV2ForCausalLM):

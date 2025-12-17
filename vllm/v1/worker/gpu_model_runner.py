@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
+import json
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
@@ -183,6 +184,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
     ):
+        self._dump_data_counter = 0 #NOTE:patch
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
 
@@ -390,6 +392,11 @@ class GPUModelRunner(
         self.num_spec_tokens = 0
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
+
+
+        # NOTE:patch
+        # Hardcode the aux hidden state outputs so we can serialize them.
+        self.use_aux_hidden_state_outputs = True
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -2822,6 +2829,31 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            assert isinstance(input_ids, torch.Tensor)
+            if input_ids.shape[0] > 2 and get_tp_group().is_first_rank:
+                # Serializing the hidden states. Let's read the metadata:
+                try:
+                    with open("/dump_tmp/meta.json") as f:
+                        meta = json.load(f)
+                    output_file = meta["output_file"]
+                    data_to_save = {
+                        "hidden_states": hidden_states.cpu().detach().clone(),
+                        "input_ids": input_ids.cpu().detach().clone(),
+                        "conversation_id": meta["conversation_id"],
+                    }
+                    if aux_hidden_states is not None:
+                        data_to_save["aux_hidden_states"] = torch.cat([
+                            aux_hidden_layer.cpu().detach().clone()
+                            for aux_hidden_layer in aux_hidden_states
+                        ],
+                                                                    dim=-1)
+                    torch.save(data_to_save, output_file)
+                except FileNotFoundError:
+                    # If the metadata file is not found, we just skip saving.
+                    logger.warning(
+                        "Metadata file not found. Skipping saving hidden states.")
+
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -3331,24 +3363,8 @@ class GPUModelRunner(
                     eplb_models += 1
 
             if self.use_aux_hidden_state_outputs:
-                if not supports_eagle3(self.get_model()):
-                    raise RuntimeError(
-                        "Model does not support EAGLE3 interface but "
-                        "aux_hidden_state_outputs was requested"
-                    )
-
-                # Try to get auxiliary layers from speculative config,
-                # otherwise use model's default layers
-                aux_layers = self._get_eagle3_aux_layers_from_config()
-                if aux_layers:
-                    logger.info(
-                        "Using auxiliary layers from speculative config: %s",
-                        aux_layers,
-                    )
-                else:
-                    aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
-
-                self.model.set_aux_hidden_state_layers(aux_layers)
+                # this should be (2,30,58) for kimi k2 thinking 
+                self.model.set_aux_hidden_state_layers(self.model.get_eagle3_aux_hidden_state_layers())
             time_after_load = time.perf_counter()
         self.model_memory_usage = m.consumed_memory
         logger.info_once(
